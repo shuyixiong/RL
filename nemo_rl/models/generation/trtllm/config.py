@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -21,7 +21,15 @@ class TrtllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     gpu_memory_utilization: NotRequired[float]
     max_model_len: int
+    # Compute / weight precision for the rollout engine.
+    # - "bfloat16" / "float16": vanilla path, weights stay in HP.
+    # - "fp8": FP8 block-scaled rollout (DeepSeek recipe, block=[128, 128]).
+    #   Trainer keeps BF16; ``trtllm_backend`` casts BF16 → FP8 at refit time
+    #   and injects per-block scale_inv via
+    #   ``nemo_rl.models.generation.trtllm.quantization.fp8``.
     precision: NotRequired[str]
+    # KV-cache storage dtype.  ``"fp8"`` requires ``precision="fp8"``.
+    kv_cache_dtype: NotRequired[Literal["auto", "fp8"]]
     max_batch_size: NotRequired[int]
     max_num_tokens: NotRequired[int]
     expose_http_server: NotRequired[bool]

@@ -118,9 +118,19 @@ class NcclExtension(WorkerExtension):
         model_engine = self.engine.model_engine
         model = model_engine.model
 
+        # FP8 rollout: cast trainer-side BF16 → FP8 block-scaled with
+        # per-block scale_inv before handing the dict to
+        # ``model_loader.reload``.  No-op (passthrough) when the live model
+        # is not FP8 quantised.
+        from nemo_rl.models.generation.trtllm.quantization import fp8 as _fp8
+
         def load_model_weight_func(weight_list):
+            if _fp8.is_fp8_model(model.model_config.quant_config):
+                weights_dict = _fp8.load_weights(weight_list)
+            else:
+                weights_dict = dict(weight_list)
             model_engine.model_loader.reload(
-                model, dict(weight_list), allow_partial_loading=True,
+                model, weights_dict, allow_partial_loading=True,
             )
 
         with self.engine.control_action(drain=drain):
@@ -190,6 +200,12 @@ class NcclExtension(WorkerExtension):
         model_engine = self.engine.model_engine
         model = model_engine.model
 
+        # FP8 rollout: cast trainer-side BF16 → FP8 block-scaled before reload.
+        # No-op (passthrough) for non-FP8 models.
+        from nemo_rl.models.generation.trtllm.quantization import fp8 as _fp8
+
+        is_fp8 = _fp8.is_fp8_model(model.model_config.quant_config)
+
         buffer = None
         weights = None
         try:
@@ -228,6 +244,9 @@ class NcclExtension(WorkerExtension):
                     f"IPC payload offset mismatch: computed={offset}, sent={used_bytes}. "
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
+
+                if is_fp8:
+                    weights = _fp8.load_weights(list(weights.items()))
 
                 model_engine.model_loader.reload(
                     model, weights, allow_partial_loading=True,

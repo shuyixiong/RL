@@ -103,6 +103,21 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
 
         precision = trtllm_cfg.get("precision", "bfloat16")
 
+        # precision=fp8: TRT-LLM constructs the model with FP8BlockScalesLinear,
+        # NeMo-RL casts BF16 trainer weights → FP8 at refit time.  The model
+        # engine still uses bf16 compute dtype (FP8 is weight-only block scales)
+        # so leave the LLM(dtype=) field on bfloat16.
+        fp8_extra_llm_kwargs: dict[str, Any] = {}
+        if precision == "fp8":
+            from nemo_rl.models.generation.trtllm.quantization.fp8 import init_fp8
+
+            fp8_extra_llm_kwargs = init_fp8(
+                trtllm_cfg=trtllm_cfg,
+                model_name=self.model_name,
+                model_parallel_size=tp_size,
+            )
+            precision = "bfloat16"  # overriden by quant_config for linear layers
+
         # One PG entry per worker (placement_groups=[pg]*N,
         # placement_bundle_indices=[[i0], [i1], ...]) so the expansion
         # generalises to multi-PG layouts (cross-node TP) when
@@ -141,10 +156,18 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         if "max_num_tokens" in trtllm_cfg:
             llm_kwargs["max_num_tokens"] = trtllm_cfg["max_num_tokens"]
 
+        # KV-cache settings (applied below, after ``trtllm_kwargs`` merge, so
+        # they patch whatever ``kv_cache_config`` ends up in llm_kwargs rather
+        # than being clobbered by a later user override).  ``kv_cache_dtype="fp8"``
+        # only makes sense paired with FP8 weights (``precision="fp8"``); the
+        # FP8 model loader handles static scale book-keeping internally.
         gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
-        if gpu_mem_util is not None:
-            llm_kwargs["kv_cache_config"] = KvCacheConfig(
-                free_gpu_memory_fraction=gpu_mem_util,
+        kv_cache_dtype = trtllm_cfg.get("kv_cache_dtype", "auto")
+        if kv_cache_dtype == "fp8" and trtllm_cfg.get("precision") != "fp8":
+            raise ValueError(
+                "trtllm_cfg.kv_cache_dtype='fp8' requires "
+                "trtllm_cfg.precision='fp8'. FP8 KV cache may only be paired "
+                "with FP8 model weights."
             )
 
         moe_tp = trtllm_cfg.get("moe_tensor_parallel_size")
@@ -160,9 +183,33 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             llm_kwargs["sleep_config"] = SleepConfig()
             llm_kwargs["per_worker_gpu_share"] = 0.5
 
+        # FP8 quant_config (if any) goes in just before trtllm_kwargs so users
+        # can still override via the escape hatch if needed.
+        llm_kwargs.update(fp8_extra_llm_kwargs)
+
         # Escape hatch: spread user-provided TRT-LLM kwargs last so they can
         # override anything above for advanced tuning.
         llm_kwargs.update(self.cfg.get("trtllm_kwargs") or {})
+
+        # Merge our kv-cache overrides INTO whatever ``kv_cache_config`` ended
+        # up in llm_kwargs (either the default we set above, a user-supplied
+        # one via trtllm_kwargs, or TRT-LLM's default-factory).  Doing it after
+        # the dict updates avoids losing dtype / free_gpu_memory_fraction when
+        # the user provides their own ``kv_cache_config`` for unrelated tuning.
+        if gpu_mem_util is not None or kv_cache_dtype != "auto":
+            kv_cfg_existing = llm_kwargs.get("kv_cache_config")
+            kv_overrides: dict[str, Any] = {}
+            if gpu_mem_util is not None:
+                kv_overrides["free_gpu_memory_fraction"] = gpu_mem_util
+            if kv_cache_dtype != "auto":
+                kv_overrides["dtype"] = kv_cache_dtype
+            if kv_cfg_existing is None:
+                llm_kwargs["kv_cache_config"] = KvCacheConfig(**kv_overrides)
+            else:
+                # KvCacheConfig is a pydantic StrictBaseModel: in-place setattr
+                # is the documented mutation path.
+                for k, v in kv_overrides.items():
+                    setattr(kv_cfg_existing, k, v)
 
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.
@@ -354,7 +401,11 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
     async def reset_prefix_cache_async(self, **kwargs: Any) -> bool:
         if self.llm is None:
             return True
-        await self.llm.reset_prefix_cache()
+        # ``reset_prefix_cache`` is defined on the ray worker extension
+        # (``NcclExtension`` inherits from rlhf_utils.WorkerExtension which
+        # provides it), NOT on AsyncLLM itself.  Dispatch via collective_rpc
+        # so it actually reaches the per-rank PyExecutor.
+        await self.llm.collective_rpc("reset_prefix_cache")
         return True
 
     # ------------------------------------------------------------------ #

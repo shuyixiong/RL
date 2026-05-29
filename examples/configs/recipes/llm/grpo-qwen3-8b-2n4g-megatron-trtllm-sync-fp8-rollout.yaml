@@ -1,0 +1,91 @@
+# Sync GRPO on Qwen3-8B with TRT-LLM inference, FP8 rollout (rollout-only),
+# COLOCATED layout (train + gen share GPUs on the same nodes).
+#
+#   - Trainer (Megatron) stays BF16
+#   - Rollout (TRT-LLM) holds FP8 block-scaled weights (DeepSeek recipe);
+#     NeMo-RL casts BF16 -> FP8 at refit via
+#     nemo_rl.models.generation.trtllm.quantization.fp8.
+#   - 2 nodes x 4 GPUs, colocated: same 8 GPUs run both train and gen,
+#     gpu_memory_utilization reduced to 0.6 to leave room for the trainer.
+#
+# Mirrors grpo-qwen3-8b-2n4g-megatron-trtllm-colocated.yaml structure but
+# enables FP8 rollout via ``trtllm_cfg.precision: fp8``.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_period: 10
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-8b-2n4g-megatron-trtllm-sync-fp8-rollout
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3ForCausalLM
+    tensor_model_parallel_size: 4
+    attention_backend: flash
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size}, 2}
+  generation:
+    backend: trtllm
+    trtllm_cfg:
+      tensor_parallel_size: 4
+      precision: fp8
+      max_model_len: ${policy.max_total_sequence_length}
+      max_batch_size: 256
+      max_num_tokens: 65536
+      async_engine: true
+      gpu_memory_utilization: 0.6
+    trtllm_kwargs:
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+      # Force the cute_dsl FP8 GEMM kernel.  This also disables TRT-LLM's
+      # post_load_weights resmooth_to_fp8_e8m0() (linear.py:1244-1263),
+      # which on Blackwell sm_100f re-quantises our fp32 block scales into
+      # E8M0 pow2 form — that lossy re-quantisation accounts for ~0.003
+      # of the rollout-vs-trainer KL gap compared to the vLLM FP8 path.
+      use_cute_dsl_blockscaling_mm: true
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  dapo:
+    num_workers: 16
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-qwen3-8b-2n4g-megatron-trtllm-sync-fp8-rollout-colocated
+  wandb_enabled: true
+  wandb:
+    project: nemorl-trtllm-run
+    name: grpo-qwen3-8b-2n4g-megatron-trtllm-sync-fp8-rollout-colocated
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
