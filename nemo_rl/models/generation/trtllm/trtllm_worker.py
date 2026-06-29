@@ -361,18 +361,167 @@ class TrtllmGenerationWorkerImpl:
     #  Helpers
     # ------------------------------------------------------------------ #
 
+    def _resolve_stop_tokens(self) -> tuple[Optional[int], list[int]]:
+        """Resolve (end_id, stop_token_ids) for TRT-LLM's TorchSampler.
+
+        TRT-LLM TorchSampler stops only on end_id. For chat-format prompts the
+        model ends each assistant turn with a chat-end token (e.g. <|im_end|>
+        for Qwen/Nemotron, <|eot_id|> for Llama-3) that is *different* from the
+        base eos_token_id. If end_id is left as the base eos the sampler may
+        ignore the chat-end token and loop into a second turn, inflating
+        response lengths until max_tokens is hit. We therefore look up the
+        chat-end token from the tokenizer's added vocab and use it as end_id,
+        while still passing the full union as stop_token_ids.
+        """
+        # Honor explicit user override.
+        user_stop = self.cfg.get("stop_token_ids") or []
+        if user_stop:
+            return user_stop[0], list(user_stop)
+
+        if getattr(self, "_resolved_stop_cache", None) is not None:
+            return self._resolved_stop_cache
+
+        import sys
+        print("###NEMORL_TRTLLM_FIX### entering _resolve_stop_tokens (no cache)", flush=True, file=sys.stderr)
+
+        from transformers import AutoConfig, AutoTokenizer, GenerationConfig
+
+        all_stop_ids: list[int] = []
+
+        def _add(t):
+            if t is None:
+                return
+            for x in (t if isinstance(t, list) else [t]):
+                if isinstance(x, int) and x not in all_stop_ids:
+                    all_stop_ids.append(x)
+
+        try:
+            hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+            _add(getattr(hf_config, "eos_token_id", None))
+        except Exception as e:
+            import sys
+            print(f"[TrtllmWorker] AutoConfig load failed: {e}", flush=True, file=sys.stderr)
+        print(f"###NEMORL_TRTLLM_FIX### after AutoConfig, all_stop_ids={all_stop_ids}", flush=True, file=sys.stderr)
+
+        try:
+            gen_config = GenerationConfig.from_pretrained(self.model_name)
+            _add(getattr(gen_config, "eos_token_id", None))
+        except Exception as e:
+            print(f"###NEMORL_TRTLLM_FIX### GenerationConfig load failed: {e}", flush=True, file=sys.stderr)
+        print(f"###NEMORL_TRTLLM_FIX### after GenConfig, all_stop_ids={all_stop_ids}", flush=True, file=sys.stderr)
+
+        chat_end_id: Optional[int] = None
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            _add(tokenizer.eos_token_id)
+            added_vocab = tokenizer.get_added_vocab()
+            for stop_str in ("<|im_end|>", "<|eot_id|>", "<|end_of_turn|>"):
+                if stop_str in added_vocab:
+                    tid = added_vocab[stop_str]
+                    if tid not in all_stop_ids:
+                        all_stop_ids.append(tid)
+                    if chat_end_id is None:
+                        chat_end_id = tid
+        except Exception as e:
+            import sys
+            print(f"[TrtllmWorker] tokenizer load failed: {e}", flush=True, file=sys.stderr)
+        print(f"###NEMORL_TRTLLM_FIX### after Tokenizer, all_stop_ids={all_stop_ids}, chat_end_id={chat_end_id}", flush=True, file=sys.stderr)
+
+        if chat_end_id is not None:
+            primary_end_id: Optional[int] = chat_end_id
+        elif all_stop_ids:
+            primary_end_id = all_stop_ids[0]
+        else:
+            primary_end_id = None
+
+        import sys
+        print(
+            f"###NEMORL_TRTLLM_FIX### resolved end_id={primary_end_id}, stop_token_ids={all_stop_ids}",
+            flush=True,
+            file=sys.stderr,
+        )
+        self._resolved_stop_cache = (primary_end_id, all_stop_ids)
+        return self._resolved_stop_cache
+
     def _build_sampling_params(self, *, greedy: bool):
+        import sys
+        if not getattr(self, "_logged_sampling_params_once", False):
+            print("###NEMORL_TRTLLM_FIX### _build_sampling_params CALLED", flush=True, file=sys.stderr)
+            self._logged_sampling_params_once = True
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else 0)
         temperature = 0.0 if greedy else self.cfg["temperature"]
-        stop_ids = self.cfg.get("stop_token_ids") or []
+
+        # INLINE _resolve_stop_tokens logic here to bypass Ray's @ray.remote
+        # method tracing wrapper, which captures stale method references in a
+        # closure and prevents edits to the standalone method from taking effect.
+        cached = getattr(self, "_resolved_stop_cache", None)
+        if cached is not None:
+            end_id, stop_ids = cached
+        else:
+            user_stop = self.cfg.get("stop_token_ids") or []
+            if user_stop:
+                end_id = user_stop[0]
+                stop_ids = list(user_stop)
+            else:
+                all_stop_ids: list[int] = []
+
+                def _add(t):
+                    if t is None:
+                        return
+                    for x in (t if isinstance(t, list) else [t]):
+                        if isinstance(x, int) and x not in all_stop_ids:
+                            all_stop_ids.append(x)
+
+                from transformers import AutoConfig, AutoTokenizer, GenerationConfig
+                try:
+                    hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+                    _add(getattr(hf_config, "eos_token_id", None))
+                except Exception as e:
+                    print(f"###NEMORL_TRTLLM_FIX### AutoConfig load failed: {e}", flush=True, file=sys.stderr)
+                try:
+                    gen_config = GenerationConfig.from_pretrained(self.model_name)
+                    _add(getattr(gen_config, "eos_token_id", None))
+                except Exception:
+                    pass
+                chat_end_id = None
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+                    _add(tokenizer.eos_token_id)
+                    added_vocab = tokenizer.get_added_vocab()
+                    for stop_str in ("<|im_end|>", "<|eot_id|>", "<|end_of_turn|>"):
+                        if stop_str in added_vocab:
+                            tid = added_vocab[stop_str]
+                            if tid not in all_stop_ids:
+                                all_stop_ids.append(tid)
+                            if chat_end_id is None:
+                                chat_end_id = tid
+                except Exception as e:
+                    print(f"###NEMORL_TRTLLM_FIX### tokenizer load failed: {e}", flush=True, file=sys.stderr)
+                if chat_end_id is not None:
+                    end_id = chat_end_id
+                elif all_stop_ids:
+                    end_id = all_stop_ids[0]
+                else:
+                    end_id = None
+                stop_ids = all_stop_ids
+                print(
+                    f"###NEMORL_TRTLLM_FIX### resolved end_id={end_id}, stop_token_ids={stop_ids}",
+                    flush=True, file=sys.stderr,
+                )
+            self._resolved_stop_cache = (end_id, stop_ids)
 
         return self.TrtSamplingParams(
             temperature=temperature,
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
             max_tokens=self.cfg["max_new_tokens"],
-            end_id=stop_ids[0] if stop_ids else None,
+            end_id=end_id,
+            stop_token_ids=stop_ids or None,
+            # Keep the EOS / stop token in the returned token_ids so that the
+            # response sequence matches HF / vLLM behavior. Required for
+            # logprob alignment with training-side Megatron.
+            include_stop_str_in_output=True,
             logprobs=True,
         )
 

@@ -3,11 +3,11 @@ grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 8
 checkpointing:
-  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-fsdp2
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-fsdp2-trtllm
 policy:
-  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  model_name: /lustre/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/shuyix/hf_cache/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
   tokenizer:
-    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    name: /lustre/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/shuyix/hf_cache/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   train_global_batch_size: 16
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -29,15 +29,29 @@ policy:
   sequence_packing:
     enabled: false
   generation:
-    vllm_cfg:
+    backend: trtllm
+    stop_token_ids: [2, 11]
+    trtllm_cfg:
       tensor_parallel_size: 4
-      gpu_memory_utilization: 0.7
+      precision: ${policy.precision}
+      gpu_memory_utilization: 0.5
+      async_engine: true
+      max_model_len: ${policy.max_total_sequence_length}
+    trtllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
 logger:
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemorl-trtllm-run
-    name: grpo-nanov3-30BA3B-2n4g-fsdp2
+    name: grpo-nanov3-30BA3B-2n4g-fsdp2-trtllm
 cluster:
   gpus_per_node: 4
   num_nodes: 2
