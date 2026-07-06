@@ -61,6 +61,8 @@ payload raises at startup so misconfiguration surfaces immediately.
 The supported worker types are:
 - **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **TRT-LLM generation (sync)**: Pattern matched against `"trtllm_generation_worker"`
+- **TRT-LLM generation (async)**: Pattern matched against `"trtllm_async_generation_worker"`
 
 ## Example Usage
 
@@ -79,6 +81,24 @@ NRL_NSYS_PROFILE_STEP_RANGE=1:2 NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*" uv ru
 
 ```bash
 NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker,vllm_generation_worker" uv run examples/run_grpo.py grpo.max_num_steps=5
+```
+
+### Profile TRT-LLM Generation
+
+TRT-LLM generation uses the same `NRL_NSYS_WORKER_PATTERNS` / `NRL_NSYS_PROFILE_STEP_RANGE`
+interface. The outer generation actor (`trtllm_generation_worker` for sync, or
+`trtllm_async_generation_worker` for async) matches a pattern and forwards the resolved
+options into TRT-LLM's inner Ray executor via `ray_worker_nsight_options`, so the ranks
+that actually run the engine are the ones profiled.
+
+On top of the shared base config, TRT-LLM layers `python-gil,osrt` into the trace list,
+enables `cuda-memory-usage`, sets `capture-range-end=repeat-shutdown:1` with `kill=none`,
+and adds `%h` to the output name so per-host files don't collide. The TRT-LLM engine
+self-manages its capture window, so the trainer's `start_gpu_profiling()` /
+`stop_gpu_profiling()` hooks are no-ops for this backend.
+
+```bash
+NRL_NSYS_PROFILE_STEP_RANGE=3:5 NRL_NSYS_WORKER_PATTERNS="*trtllm*generation_worker" uv run examples/run_grpo.py grpo.max_num_steps=5
 ```
 
 ### Profile Megatron Workers
