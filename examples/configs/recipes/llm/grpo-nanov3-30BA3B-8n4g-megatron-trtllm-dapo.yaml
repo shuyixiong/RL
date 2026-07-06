@@ -1,0 +1,180 @@
+# GRPO recipe: NVIDIA-Nemotron-3-Nano-30B-A3B, Megatron backend + TRT-LLM
+# generation, on the DAPO math dataset.
+#
+# Derived from the official nano3 stage2_rl config
+#   https://github.com/NVIDIA-NeMo/Nemotron/blob/main/src/nemotron/recipes/nano3/stage2_rl/config/tiny.yaml
+# with two intentional changes requested:
+#   1. generation backend vLLM -> TRT-LLM
+#   2. dataset -> DAPO (full DAPO algorithm: dynamic sampling, reward
+#      shaping/scaling, clip-higher + clip-c, no leave-one-out baseline)
+#
+# Reference-fixed keys (kept identical to tiny.yaml, do not change):
+#   max_total_sequence_length=49152, max_new_tokens=49152 (interpolated),
+#   num_generations_per_prompt=16, num_prompts_per_step=128,
+#   base model = NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 (+ its tokenizer).
+#
+# NOTE on parallelism: tiny.yaml uses TP2/PP2/CP4/EP8 (its cluster block says 1x8
+# but that is inconsistent with its own parallelism; the sibling default.yaml runs
+# the identical parallelism on 32 nodes / 256 GPUs). Here we target 8 nodes x 4 GPUs
+# (32 GPUs) and set PP=1, keeping the reference's TP2/CP4/EP8/ETP1 otherwise:
+#   TP2 * PP1 * CP4 = 8 -> DP4, and EP8 divides DP*TP=8. CP4 splits the 49K sequence.
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 10000
+  normalize_rewards: true
+  # DAPO: sample without a leave-one-out baseline, oversample + filter zero-advantage prompts.
+  use_leave_one_out_baseline: false
+  # Dynamic sampling disabled: a cold base model gets ~everything wrong (uniform
+  # zero-advantage), so the non-zero-advantage filter can't fill a batch and it
+  # crashes (dynamic_sampling_max_gen_batches). batch_multiplier must be 1 when off.
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  val_period: 10 # aligned with checkpointing.save_period so every saved ckpt has val:accuracy for top-k
+  val_at_start: false
+  max_val_samples: 256
+  val_batch_size: 256
+  # DAPO reward transforms
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 2048
+    # aligned to the 49152 generation budget (max_new_tokens - overlong_buffer)
+    max_response_length: 47104
+
+loss_fn:
+  # DAPO: clip-higher (asymmetric ratio clip) + clip-c, no KL penalty
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  # loss-formulation improvements carried over from tiny.yaml
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-nanov3-30BA3B-8n4g-megatron-trtllm-dapo
+  keep_top_k: 5
+  save_period: 10
+
+policy:
+  # Local mirror of nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  # (/workspace <- /lustre/fsw/coreai_comparch_trtllm/shuyix mount)
+  model_name: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    # Policy stays on the Base model, but the Base tokenizer has NO chat_template
+    # and math_hf_data_processor requires one. The instruct model (same family/vocab)
+    # ships chat_template.jinja, so use it for the tokenizer only.
+    name: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  # Reference value (must not change). CP4 (below) splits this 49K sequence across
+  # 4 ranks, as in the reference; combined with activation_checkpointing + mbs=1 +
+  # sequence packing this should fit on 8 nodes.
+  max_total_sequence_length: 49152
+  precision: bfloat16
+
+  # Disable the FSDP2/dtensor path and its optimizer/scheduler; use Megatron.
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    # Reference TP2/CP4/EP8/ETP1 with PP=1 (see header). world=32: TP2*PP1*CP4=8 -> DP4,
+    # EP8 shards experts across DP4*TP2=8.
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 4
+    sequence_parallel: true
+    # nano3 MoE settings from tiny.yaml
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_permute_fusion: true
+    moe_token_dispatcher_type: alltoall
+    apply_rope_fusion: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+    # Optimizer follows the common DAPO recipe setting (not tiny.yaml's 3e-6/wd0):
+    # lr=1e-6 constant, weight_decay=0.1, 10-step warmup.
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.1
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
+
+  sequence_packing:
+    enabled: true
+
+  # divisible by TP * 2 * CP for sequence-parallel + context-parallel (49152 / 16 = 3072)
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+
+  generation:
+    backend: trtllm
+    max_new_tokens: ${sub:${policy.max_total_sequence_length}, ${data.max_input_seq_length}}
+    trtllm_cfg:
+      # TP1: 32 full-model replicas (one per GPU). The real per-engine concurrency is
+      # ~2048/32 = 64 (round-robin), so cap max_batch_size to 64. This shrinks the
+      # per-engine Mamba state pool from ~95 GiB (default max_batch=2048) to ~3 GiB,
+      # which is what made TP1 fail before ("Impossible to fit"); the attention KV
+      # itself is tiny (~0.28 GiB for 49K).
+      tensor_parallel_size: 1
+      max_batch_size: 64
+      precision: ${policy.precision}
+      max_model_len: ${policy.max_total_sequence_length}
+      async_engine: true
+      gpu_memory_utilization: 0.8
+    trtllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemorl-trtllm-run
+    name: grpo-nanov3-30BA3B-8n4g-megatron-trtllm-dapo
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
