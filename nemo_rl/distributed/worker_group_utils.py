@@ -79,6 +79,28 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
     return {}
 
 
+def get_trtllm_ray_worker_nsight_options(worker_name: str) -> dict[str, Any] | None:
+    """Return the resolved nsys options for TRT-LLM's inner Ray workers.
+
+    The public configuration remains the NeMo-RL worker-pattern interface;
+    this adapter layers TRT-LLM-specific trace options (python-gil/osrt,
+    CUDA memory usage, and the engine-managed capture window) on top of the
+    shared base config without mutating it, so other backends are unaffected.
+    """
+    base = get_nsight_config_if_pattern_matches(worker_name).get("nsight")
+    if base is None:
+        return None
+    options = dict(base)
+    options["t"] = "cuda,nvtx,python-gil,osrt"
+    options["cuda-memory-usage"] = "true"
+    options["capture-range-end"] = "repeat-shutdown:1"
+    options["kill"] = "none"
+    options["o"] = f"'{worker_name}_{NRL_NSYS_PROFILE_STEP_RANGE}_%h_%p'"
+    if NRL_NSYS_EXTRA_OPTIONS:
+        options.update(NRL_NSYS_EXTRA_OPTIONS)
+    return options
+
+
 def recursive_merge_options(
     default_options: dict[str, Any], extra_options: dict[str, Any]
 ) -> dict[str, Any]:

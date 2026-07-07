@@ -31,7 +31,10 @@ import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.distributed.worker_group_utils import (
+    get_nsight_config_if_pattern_matches,
+    get_trtllm_ray_worker_nsight_options,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -176,6 +179,15 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         # Escape hatch: spread remaining user-provided TRT-LLM kwargs last so
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
+
+        # AsyncLLM uses the same Ray TP executor as LLM.  Keep an explicit
+        # caller value authoritative, but otherwise forward the NeMo-RL
+        # resolved nsys options into that executor.
+        nsight_options = get_trtllm_ray_worker_nsight_options(
+            "trtllm_async_generation_worker"
+        )
+        if nsight_options is not None:
+            llm_kwargs.setdefault("ray_worker_nsight_options", nsight_options)
 
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.

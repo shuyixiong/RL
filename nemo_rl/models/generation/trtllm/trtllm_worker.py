@@ -32,7 +32,10 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.distributed.worker_group_utils import (
+    get_nsight_config_if_pattern_matches,
+    get_trtllm_ray_worker_nsight_options,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -161,6 +164,14 @@ class TrtllmGenerationWorkerImpl:
         # Escape hatch: spread user-provided TRT-LLM kwargs last so they can
         # override anything above for advanced tuning.
         llm_kwargs.update(self.cfg.get("trtllm_kwargs") or {})
+
+        # TRT-LLM creates its TP workers through its own Ray executor.  Pass
+        # the same resolved nsys options as the outer NeMo-RL actor so that
+        # executor can wrap its workers too.  setdefault deliberately keeps a
+        # caller supplied advanced executor configuration authoritative.
+        nsight_options = get_trtllm_ray_worker_nsight_options("trtllm_generation_worker")
+        if nsight_options is not None:
+            llm_kwargs.setdefault("ray_worker_nsight_options", nsight_options)
 
         self.llm = tensorrt_llm.LLM(**llm_kwargs)
 

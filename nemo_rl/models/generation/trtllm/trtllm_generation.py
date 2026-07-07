@@ -427,6 +427,22 @@ class TrtllmGeneration(GenerationInterface):
             print(f"Error in finish_generation: {e}")
             return False
 
+    def start_gpu_profiling(self) -> None:
+        # TRT-LLM engine self-manages its cudaProfilerApi window via the
+        # TLLM_PROFILE_START_STOP env var (iteration-based). Toggling the
+        # profiler from the trainer here would race that window, so this is
+        # intentionally a no-op.
+        print(
+            "[TrtllmGeneration] start_gpu_profiling deferred to engine "
+            "TLLM_PROFILE_START_STOP window"
+        )
+
+    def stop_gpu_profiling(self) -> None:
+        print(
+            "[TrtllmGeneration] stop_gpu_profiling deferred to engine "
+            "TLLM_PROFILE_START_STOP window"
+        )
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_refit_info_async" if self.async_engine else "prepare_refit_info",
