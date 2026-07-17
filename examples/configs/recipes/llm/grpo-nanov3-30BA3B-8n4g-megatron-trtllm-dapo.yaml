@@ -143,7 +143,7 @@ policy:
       precision: ${policy.precision}
       max_model_len: ${policy.max_total_sequence_length}
       async_engine: true
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.7
     trtllm_kwargs:
       mamba_ssm_cache_dtype: float32
       batch_wait_timeout_iters: 32
