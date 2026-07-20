@@ -1,0 +1,126 @@
+# Async GRPO (1-off, in-flight weight updates) on Qwen3-30B-A3B (MoE) with
+# TRT-LLM inference, FP8 END-TO-END, NON-COLOCATED 4n8g (2 train + 2 gen).
+#
+# Mirror of grpo-qwen3-30ba3b-4n8g-megatron-trtllm-sync-fp8train-fp8rollout.yaml
+# but with async layout and gen=2 nodes (TP=8 cross-node).
+#
+# Requirements:
+#   - container: nemorl-trtllm-py313-torch210-async-x86.sqsh (has the
+#     PyExecutor.control_action(drain=...) patch for in-flight weight update)
+#   - nemo_rl init_process_group device_id patch (already in tree)
+#   - moe_router_dtype: fp32 (TE fp8_padding rejects FP64)
+defaults: ../../../grpo_math_1B.yaml
+grpo:
+  val_period: 10
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+loss_fn:
+  use_importance_sampling_correction: true
+  reference_policy_kl_penalty: 0.04
+  truncated_importance_sampling_ratio: 2.0
+checkpointing:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/coreai_comparch_trtllm/shikiw/shikiw-nemorl-trtllm-fp8-fp8/checkpoints/async-moe-6n8g-fp8train-fp8rollout
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 1
+  save_period: 10
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_optimizer: true
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3MoeForCausalLM
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    pipeline_dtype: ${policy.precision}
+    attention_backend: flash
+    moe_router_dtype: fp32
+    moe_grouped_gemm: true
+    moe_permute_fusion: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-07
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 50
+      lr_warmup_init: 1.0e-07
+    fp8_cfg:
+      enabled: true
+      fp8: "hybrid"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+    recompute_method: uniform
+    recompute_granularity: full
+    recompute_num_layers: 1
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+  generation:
+    backend: trtllm
+    trtllm_cfg:
+      tensor_parallel_size: 8
+      precision: fp8
+      max_model_len: ${policy.max_total_sequence_length}
+      max_batch_size: 256
+      max_num_tokens: 65536
+      async_engine: true
+      gpu_memory_utilization: 0.8
+      in_flight_weight_updates: true
+      recompute_kv_cache_after_weight_updates: true
+      # Qwen3-30B-A3B intermediate_size=768; FP8_QUANT_BLOCK_SIZE=128.
+      # 768/moe_tp must be divisible by 128 → moe_tp ∈ {1, 2}. Use 2.
+      moe_tensor_parallel_size: 2
+      moe_expert_parallel_size: 4
+    trtllm_kwargs:
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+      use_cute_dsl_blockscaling_mm: false
+      moe_config:
+        backend: CUTLASS
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 8
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  dapo:
+    num_workers: 16
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-6n8g-megatron-trtllm-async-fp8train-fp8rollout
+  wandb_enabled: true
+  wandb:
+    project: shikiw-nemorl-trtllm-fp8-fp8
+    name: grpo-qwen3-30ba3b-6n8g-megatron-trtllm-async-fp8train-fp8rollout-tis-${oc.env:RUN_TS,2026-06-23}
+cluster:
+  gpus_per_node: 8
+  num_nodes: 6
