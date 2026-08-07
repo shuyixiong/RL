@@ -492,6 +492,10 @@ class RayWorkerGroup:
             )
         else:
             py_executable = actor_python_env
+        # Resolved interpreter for this group's workers, kept so sidecar actors
+        # that must import the same packages (e.g. the TRT-LLM disagg server)
+        # can join the venv instead of landing in the driver's environment.
+        self.py_executable = py_executable
 
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)

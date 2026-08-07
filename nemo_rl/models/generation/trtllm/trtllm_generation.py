@@ -487,7 +487,15 @@ class TrtllmGeneration(GenerationInterface):
         else:
             tied_groups = []
             engine_idx = 0
-            for pg_idx, pg in enumerate(placement_groups):
+            # Consume placement groups in topology order, not creation order. Ray
+            # picks the physical node behind each per-node PG, so consecutive
+            # pg_idx values can land in different NVLink domains -- and engines
+            # are laid out replica by replica, which would put a replica's
+            # context and generation engines on opposite sides of the fabric and
+            # push its KV handoff onto InfiniBand. Only the *order* changes;
+            # every PG is still used exactly once.
+            for pg_idx in cluster.get_topology_sorted_pg_indices():
+                pg = placement_groups[pg_idx]
                 if pg.bundle_count == 0:
                     continue
                 cursor = 0
@@ -590,6 +598,13 @@ class TrtllmGeneration(GenerationInterface):
                     node_id=addrs[base]["node_id"], soft=True
                 ),
                 name=f"trtllm_disagg_server_{replica_idx}",
+                # The server imports tensorrt_llm (OpenAIDisaggServer,
+                # disagg_utils), which only exists in the engine workers' venv.
+                # Without this the actor starts in the driver's environment and
+                # dies with ModuleNotFoundError: No module named 'tensorrt_llm'.
+                # The venv already exists on every node -- the worker group
+                # created it before these actors are spawned.
+                runtime_env={"py_executable": self.worker_group.py_executable},
             ).remote(replica_idx)
             self._disagg_actors.append(actor)
 
