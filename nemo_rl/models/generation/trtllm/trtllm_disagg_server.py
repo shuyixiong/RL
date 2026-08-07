@@ -91,6 +91,71 @@ _GYM_ONLY_REQUEST_FIELDS = ("return_tokens_as_token_ids", "return_token_ids")
 # Prefix vLLM uses when asked to report tokens as ids, which NeMo-Gym parses.
 _TOKEN_ID_PREFIX = "token_id:"
 
+# Paths whose bodies are validated against TRT-LLM's extra="forbid" models.
+_ADAPTED_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
+
+
+class _DropGymOnlyRequestFields:
+    """ASGI middleware stripping the vLLM-only fields from request bodies.
+
+    Deliberately raw ASGI rather than a Starlette ``BaseHTTPMiddleware``: that
+    class passes the downstream app its own captured receive channel, so
+    reassigning ``request._receive`` never reaches FastAPI's validation and the
+    request is rejected anyway. Replacing ``receive`` here is what the route
+    actually reads.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") not in _ADAPTED_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        import json
+
+        chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+        body = b"".join(chunks)
+
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and any(
+            field in payload for field in _GYM_ONLY_REQUEST_FIELDS
+        ):
+            for field in _GYM_ONLY_REQUEST_FIELDS:
+                payload.pop(field, None)
+            body = json.dumps(payload).encode()
+            # Content-Length must follow the body; a stale value makes any proxy
+            # in front of this server truncate or hang.
+            headers = [
+                (name, value)
+                for name, value in scope["headers"]
+                if name.lower() != b"content-length"
+            ]
+            headers.append((b"content-length", str(len(body)).encode()))
+            scope = {**scope, "headers": headers}
+
+        delivered = False
+
+        async def _receive() -> dict[str, Any]:
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, _receive, send)
+
 
 def _build_adaptor_class() -> type:
     """Build ``OpenAIDisaggServerAdaptor`` lazily.
@@ -149,43 +214,13 @@ def _build_adaptor_class() -> type:
         # -------------------------------------------------------------- #
 
         def _install_request_adaptor(self) -> None:
-            import json
-
-            paths = {"/v1/chat/completions", "/v1/completions"}
-
-            @self.app.middleware("http")
-            async def _drop_gym_only_fields(request: Request, call_next: Any):
-                if request.url.path not in paths:
-                    return await call_next(request)
-
-                raw = await request.body()
-                try:
-                    payload = json.loads(raw)
-                except ValueError:
-                    return await call_next(request)
-
-                dropped = {
-                    key: payload.pop(key)
-                    for key in _GYM_ONLY_REQUEST_FIELDS
-                    if key in payload
-                }
-                if not dropped:
-                    return await call_next(request)
-
-                # Starlette reads the body through _receive, so replacing it is
-                # what makes the edit visible to FastAPI's validation.
-                new_body = json.dumps(payload).encode()
-
-                async def receive() -> dict[str, Any]:
-                    return {
-                        "type": "http.request",
-                        "body": new_body,
-                        "more_body": False,
-                    }
-
-                request._receive = receive  # type: ignore[attr-defined]
-                request.state.gym_request_fields = dropped
-                return await call_next(request)
+            # Pure ASGI, not @app.middleware("http"): BaseHTTPMiddleware hands
+            # the downstream app the receive channel it captured itself, so
+            # rewriting request._receive there is invisible to FastAPI's
+            # validation and every request still fails with extra_forbidden.
+            # Wrapping receive at the ASGI layer is what actually replaces the
+            # body the route sees.
+            self.app.add_middleware(_DropGymOnlyRequestFields)
 
         # -------------------------------------------------------------- #
         #  Outbound
@@ -276,6 +311,16 @@ def start_server(
 
     node_ip = _get_node_ip_local()
     base_url = f"http://{node_ip}:{port}/v1"
+
+    # OpenAIDisaggServer.register_routes() builds a prometheus
+    # MultiProcessCollector, which raises unless PROMETHEUS_MULTIPROC_DIR points
+    # at a real directory. TRT-LLM's own entrypoint calls this helper first
+    # (tensorrt_llm/commands/serve.py); we construct the server directly, so we
+    # have to. It keeps the TemporaryDirectory alive in a module global, which
+    # is also what stops it from being collected while the server runs.
+    from tensorrt_llm._utils import set_prometheus_multiproc_dir
+
+    set_prometheus_multiproc_dir()
 
     # coordinator_url=None: this server owns its routing state in-process.
     # Replicas are disjoint so there is nothing to coordinate across them, and

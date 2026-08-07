@@ -26,7 +26,6 @@ Under PD disaggregation this endpoint is *leg-aware*. A replica's
   rebuilding them, so the sequence matches the KV that was transferred.
 """
 
-import asyncio
 import logging
 import threading
 import time
@@ -313,9 +312,8 @@ def create_app(
         )
 
         try:
-            outputs = await asyncio.to_thread(
-                llm.generate,
-                [{"prompt_token_ids": adj_prompt}],
+            output = await llm.generate_async(
+                {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
                 disaggregated_params=disagg_params,
             )
@@ -328,7 +326,6 @@ def create_app(
                 )
             raise
 
-        output = outputs[0]
         gen = output.outputs[0]
 
         if is_context_leg:
@@ -396,6 +393,23 @@ def create_app(
                 "content": answer_text,
                 "reasoning_content": reasoning_content,
             }
+
+        # NeMo-Gym reads the rollout fields off the *message*
+        # (nemo_rl/environments/nemo_gym.py: a message without
+        # generation_token_ids is skipped outright, so a miss loses the whole
+        # turn's training data silently). Aggregated serving answers Gym
+        # directly, so attach them here.
+        #
+        # Not under disaggregation: there the reply is re-validated by the
+        # disagg server against ChatMessage, which is extra="forbid" and would
+        # 400 on these. They ride the declared fields instead
+        # (choices[].token_ids, prompt_token_ids, logprobs) and the disagg
+        # server's outbound adaptor re-attaches them to the message before Gym
+        # ever sees it -- see trtllm_disagg_server._attach_rollout_fields.
+        if disagg_params is None:
+            msg_dict["prompt_token_ids"] = adj_prompt
+            msg_dict["generation_token_ids"] = gen_token_ids
+            msg_dict["generation_log_probs"] = gen_logprobs
 
         response: dict[str, Any] = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
