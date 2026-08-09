@@ -383,15 +383,23 @@ class TrtllmGeneration(GenerationInterface):
             return self.cfg
 
         overrides: dict[str, dict[str, Any]] = {}
+        role_counts: dict[str, int] = {}
         for (pg_idx, bundles), role in zip(
             node_bundle_indices, self._engine_roles, strict=True
         ):
             prefix = "ctx" if role == "context" else "gen"
+            # Ordinal within the role, so a layout with several engines of one
+            # role (CTX_ENGINES=2, or more than one replica) can still tell them
+            # apart. Only consumers that need a stable per-engine name use it --
+            # the nsys report filename, so far.
+            ordinal = role_counts.get(role, 0)
+            role_counts[role] = ordinal + 1
             # Every engine gets an entry: the worker treats a missing key as a
             # driver/worker mismatch, so absence must never read as "no
             # overrides for this engine".
             overrides[self._engine_key(pg_idx, bundles)] = {
                 "_disagg_role": role,
+                "_disagg_role_ordinal": ordinal,
                 **(self._disagg_cfg.get(f"{prefix}_trtllm_kwargs") or {}),
             }
 

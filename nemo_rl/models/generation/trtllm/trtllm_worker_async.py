@@ -44,6 +44,29 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
 
+def _tag_nsys_output(output_spec: str, tag: str) -> str:
+    """Append *tag* to the filename in an nsys ``-o`` spec.
+
+    Operates on the filename rather than substituting a known worker name,
+    because the spec may be the built-in default or anything the user put in
+    ``NRL_NSYS_EXTRA_OPTIONS`` -- including a directory, which must be left
+    where it is so the reports still land where the user asked. The value
+    arrives quoted from ``get_nsight_config_if_pattern_matches``; a
+    user-supplied one may not be, so the quoting is preserved either way.
+
+    Appended rather than prefixed so the documented report names stay
+    prefix-matchable: ``trtllm_async_generation_worker_*`` keeps finding every
+    report (docs/nsys-profiling.md), disaggregated or not.
+    """
+    quote = ""
+    if len(output_spec) >= 2 and output_spec[0] == output_spec[-1]:
+        if output_spec[0] in "'\"":
+            quote, output_spec = output_spec[0], output_spec[1:-1]
+
+    head, sep, name = output_spec.rpartition("/")
+    return f"{quote}{head}{sep}{name}_{tag}{quote}"
+
+
 class TrtllmAsyncGenerationWorkerImpl:
     """Plain (non-actor) implementation of the async TRT-LLM generation worker.
 
@@ -300,6 +323,21 @@ class TrtllmAsyncGenerationWorkerImpl:
             "trtllm_async_generation_worker"
         ).get("nsight")
         if _nsight and "ray_worker_nsight_options" not in llm_kwargs:
+            _disagg_role = self.engine_cfg.get("_disagg_role")
+            if _disagg_role:
+                # Under disaggregation every engine reports the same worker
+                # name, so the report name distinguishes them only by the %p
+                # pid -- which means matching a report to the context or
+                # generation side is a search through the driver log. Tag the
+                # filename with the role and its ordinal (a layout can run
+                # several engines of one role); %p still separates the ranks
+                # within an engine. Aggregated runs have no role and are left
+                # alone.
+                _nsight = dict(_nsight)
+                _nsight["o"] = _tag_nsys_output(
+                    _nsight["o"],
+                    f"{_disagg_role}{self.engine_cfg['_disagg_role_ordinal']}",
+                )
             llm_kwargs["ray_worker_nsight_options"] = _nsight
 
         # Defer __await__ (which fires setup_async) to post_init_async so
