@@ -162,7 +162,8 @@ def _build_adaptor_class() -> type:
 
     Deferred so importing this module does not require tensorrt_llm.
     """
-    from fastapi import Request, Response
+    import aiohttp
+    from fastapi import HTTPException, Request, Response
     from fastapi.responses import JSONResponse
     from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
     from tensorrt_llm.serve.openai_protocol import UCompletionRequest
@@ -221,6 +222,33 @@ def _build_adaptor_class() -> type:
             # Wrapping receive at the ASGI layer is what actually replaces the
             # body the route sees.
             self.app.add_middleware(_DropGymOnlyRequestFields)
+
+        # -------------------------------------------------------------- #
+        #  Errors
+        # -------------------------------------------------------------- #
+
+        def _handle_exception(self, exception: BaseException) -> None:
+            """Pass a downstream 4xx through instead of masking it as a 500.
+
+            The base implementation only re-raises ``HTTPException``; a 4xx
+            from a context/generation engine arrives as an
+            ``aiohttp.ClientResponseError`` and falls into the catch-all that
+            turns it into ``500 Internal server error``. The aggregated server
+            returns that same rejection to the caller as a 4xx, so without this
+            a deterministic client error -- most commonly the
+            ``context length exceeded`` guard in ``trtllm_http_server`` -- looks
+            like a server fault under disaggregation only, and Gym's masking
+            statistics stop being comparable between the two paths.
+            """
+            if (
+                isinstance(exception, aiohttp.ClientResponseError)
+                and 400 <= exception.status < 500
+            ):
+                self._perf_metrics_collector.http_exceptions.inc()
+                raise HTTPException(
+                    status_code=exception.status, detail=exception.message
+                )
+            super()._handle_exception(exception)
 
         # -------------------------------------------------------------- #
         #  Outbound
