@@ -163,6 +163,17 @@ sed -i '/^PyNvVideoCodec/d' requirements.txt
 #     match.
 sed -i '/^nvidia-modelopt/d' requirements.txt
 
+#   - drop the nvidia-nccl-cu13 ceiling. The ref pins <=2.30.4 to match the
+#     torch it would otherwise install, but this build reuses the base image's
+#     torch (2.14.0a0+nvinternal.rubin), which is linked against the system
+#     NCCL 2.31.2. Installing a pip NCCL into build_wheel.py's venv shadows
+#     that, and cmake's `import torch` probe then dies with
+#     "libtorch_cuda.so: undefined symbol: ncclGetPeerDeviceLeInfo" (added in
+#     2.31), reported as "PyTorch >= 1.5.0 is needed for TorchScript mode".
+#     Without the wheel, the venv falls through to the system NCCL that cmake
+#     already selects (-- Found NCCL: /usr/lib/.../libnccl.so 2.31.2).
+sed -i '/^nvidia-nccl-cu13/d' requirements.txt
+
 # cutlass_kernels/CMakeLists.txt used to invoke `setup_library.py develop
 # --user`, which needed a setup.py shim and passed a flag that is invalid
 # inside a venv. tekit de0cf4d8a dropped that execute_process entirely and now
