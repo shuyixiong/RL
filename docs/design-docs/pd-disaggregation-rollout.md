@@ -74,8 +74,9 @@ selects the router policies through `DisaggServerConfig` (see
 
 The cost of that boundary is that context affinity is no longer free. When a replica had
 exactly one prefill engine, Gym's choice of URL *was* the choice of prefill engine. Now
-`ctx_router` has to provide it, which is why it must be configured with a stateful policy
-while `gen_router` need not be.
+`ctx_router` has to provide it, which is why it should be configured with a stateful policy
+while `gen_router` need not be. Either accepts any TRT-LLM router type; a stateless
+`ctx_router` is allowed but re-prefills every later turn from scratch.
 
 Affinity is therefore established at three levels, and NeMo RL controls only the first:
 

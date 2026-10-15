@@ -27,11 +27,14 @@ policy:
       decode_engine:
         tensor_parallel_size: ${..tensor_parallel_size}
       disagg_server:
-        # Stateful, so a trajectory's turns keep reaching the prefill engine
-        # holding its prefix: conversation | kv_cache_aware
+        # Either role takes any TRT-LLM router: round_robin |
+        # load_balancing | kv_cache_aware | conversation.
+        # Use a stateful one here, so a trajectory's turns keep reaching the
+        # prefill engine holding its prefix: conversation | kv_cache_aware
         ctx_router: conversation
-        # Stateless: a decode engine receives KV freshly on every turn, so
-        # it has nothing worth returning to: round_robin | load_balancing
+        # A stateless one is enough here: a decode engine receives KV freshly
+        # on every turn, so it has nothing worth returning to:
+        # round_robin | load_balancing
         gen_router: load_balancing
         # Thin the prefill->decode relay: token ids as one base64 int32 string
         # instead of a 30k-int JSON array, and drop the redundant message

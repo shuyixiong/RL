@@ -59,10 +59,12 @@ def build_config(
         node_id: Must be distinct per replica. TRT-LLM's default is
             ``uuid.getnode() % 256``, documented as assuming a single disagg
             server per machine, and we run one per replica.
-        ctx_router: Stateful, so a trajectory's turns keep reaching the
+        ctx_router: Any TRT-LLM router type. Normally stateful (conversation
+            or kv_cache_aware), so a trajectory's turns keep reaching the
             prefill engine holding its prefix.
-        gen_router: Stateless, so placement stays local to this replica and no
-            coordinator process is needed.
+        gen_router: Any TRT-LLM router type. Normally stateless (round_robin
+            or load_balancing), so placement stays local to this replica and
+            no coordinator process is needed.
     """
     from tensorrt_llm.llmapi.disagg_utils import (
         CtxGenServerConfig,

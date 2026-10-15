@@ -420,12 +420,23 @@ def test_an_unforwarded_disagg_server_key_is_rejected():
         resolve_disagg_server_config(_config(disagg_server={"max_retries": 5}))
 
 
-def test_a_plausible_but_wrong_router_is_rejected():
-    # round_robin parses as a str but silently discards the prefix affinity the
-    # prefill engines depend on, so the schema has to reject it.
+@pytest.mark.parametrize(
+    "router", ["round_robin", "load_balancing", "kv_cache_aware", "conversation"]
+)
+def test_every_trtllm_router_is_accepted_for_both_roles(router):
+    server = resolve_disagg_server_config(
+        _config(disagg_server={"ctx_router": router, "gen_router": router})
+    )
+    assert server.ctx_router == router
+    assert server.gen_router == router
+
+
+def test_an_unknown_router_is_rejected():
+    # A misspelled type must fail at config load, not when the disagg server
+    # starts and TRT-LLM's create_router raises.
     with pytest.raises(ValidationError):
         resolve_disagg_server_config(
-            _config(disagg_server={"ctx_router": "round_robin"})
+            _config(disagg_server={"gen_router": "conversational"})
         )
 
 

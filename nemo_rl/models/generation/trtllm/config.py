@@ -18,6 +18,13 @@ from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
+# Every router type TRT-LLM's create_router (tensorrt_llm/serve/router.py)
+# accepts. Literal rather than str so a misspelled type fails at config load
+# instead of when the disagg server starts.
+TrtllmRouterType = Literal[
+    "round_robin", "load_balancing", "kv_cache_aware", "conversation"
+]
+
 
 class TrtllmDisaggServerConfig(BaseModel, extra="forbid"):
     """The ``DisaggServerConfig`` fields NeMo RL forwards to TRT-LLM.
@@ -32,12 +39,13 @@ class TrtllmDisaggServerConfig(BaseModel, extra="forbid"):
     prefill/decode.
     """
 
-    # ctx_router must be stateful or a trajectory's later turns reach an engine
-    # without its prefix and re-prefill from scratch; the decode side gets KV
-    # fresh each turn, so gen_router need not be. Literal because
-    # ctx_router="round_robin" parses fine and silently drops that affinity.
-    ctx_router: Literal["conversation", "kv_cache_aware"] = "conversation"
-    gen_router: Literal["round_robin", "load_balancing"] = "load_balancing"
+    # Either role takes any TRT-LLM router. ctx_router should be stateful
+    # (conversation or kv_cache_aware): round_robin / load_balancing send a
+    # trajectory's later turns to an engine without its prefix, which then
+    # re-prefills from scratch. The decode side gets KV fresh each turn, so a
+    # stateless gen_router needs no coordinator process.
+    ctx_router: TrtllmRouterType = "conversation"
+    gen_router: TrtllmRouterType = "load_balancing"
 
     # Relay prefill->decode prompt token ids as one base64 int32 string instead
     # of a 30k-int JSON array (DisaggServerConfig.gen_tokids_ctxbytes).
