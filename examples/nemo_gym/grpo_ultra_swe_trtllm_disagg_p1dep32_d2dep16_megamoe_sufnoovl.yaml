@@ -1,0 +1,545 @@
+# FULL (flattened) recipe of job 572703 (2026-11-16, user request): the best 1P2D config so far, written out as one file
+# on top of grpo_qwen3_30ba3b_instruct.yaml, like grpo_ultra_swe_trtllm_disagg_dep16_ctxmoe16k_mb4_kv070.yaml.
+# It folds in the whole chain 572703 ran with (each child overrides its parent):
+#   grpo_ultra_swe_trtllm_disagg_dep16_ctxmoe16k_mb4_kv070.yaml                      base (2 DEP16 P + 2 DEP16 D)
+#   ..._kv070_rm1024_1p1d_genmb64.yaml          1 DEP32 prefill (max_num_tokens 1,024, gloo votes) + 1 DEP16 decode
+#                                               (mb64, max_num_tokens 4,096), 12 Gym replicas
+#   ..._kv070_rm1024_1p2d_genmb64.yaml          2 decode engines, gen_router conversation, 16 Gym replicas
+#   ..._kv070_rm1024_1p2d_genmb32.yaml          decode max_batch_size 32
+#   ..._kv070_rm1024_1p2d_genmb32_main_megamoe_trtllm.yaml   prefill MoE MEGAMOE_CUTEDSL (per-rank cap 1,024, NCCL votes,
+#                                               SM reserve 8), decode MoE TRTLLM, agent timeout 1,800 s
+#   ..._main_megamoe_trtllm_v2.yaml             no recipe change (image bb8c5253d5)
+#   ..._main_megamoe_trtllm_v2_sufnoovl.yaml    prefill context_scheduling_policy shortest_uncached_first + prefill
+#                                               overlap scheduler off
+# Layout: 1 DEP32 prefill + 2 DEP16 decode = 64 GPUs = 16 GB200 nodes per replica. max_trajectory_age_steps 1.
+# Step 1 vs 573974 (same chain without the sufnoovl change): prefill wait p90 -62 %, TTFT p50 -20 %, total prefill-queue
+# time -16 %; prefill wait p99 is higher (7.9 -> 15.6 s: no aging bound, long prompts wait behind short ones).
+# Run it with the image and env 572703 used (results/...v2_sufnoovl...-1113-071719/gen_only.env):
+#   CONT=nemo-rl-trtllm-disagg-rl_swe_bench_nemotron_v2-bb8c5253d5-aarch64-swe-ovl-megamoe-nccl2326.sqsh,
+#   FLASHINFER_CUBIN_DIR=flashinfer_cubin_cache_fi073, SEGMENT=8 with one pod pinned.
+# Older notes on the base recipe's history are in grpo_ultra_swe_trtllm_disagg_dep16_ctxmoe16k_mb4_kv070.yaml.
+defaults: "grpo_qwen3_30ba3b_instruct.yaml"
+
+cluster:
+  gpus_per_node: 4        # GB200: 4 GPUs/node
+  num_nodes: 3            # overridden by launch script
+  # Order Ray bundles by NVLink domain / topo_rank so consecutive ranks
+  # share an NVLink domain (plain node_id/gpu_id ordering otherwise).
+  # Overridden by the launch script to match sbatch --segment.
+  segment_size: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/ultra-swe-trtllm   # overridden by launch script
+  metric_name: "train:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 5
+  checkpoint_must_save_by: "00:03:30:00"   # ruit/Erin default: leaves ~1.5h so an in-flight step can still finish and save
+  model_save_format: safetensors
+  save_consolidated: false
+
+grpo:
+  num_prompts_per_step: 32         # 2026-10-17: 16 -> 32 with the 2-prefill 2-decode 16-node layout (the source bench set 32 via its launch script)
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_epochs: 4
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 10000
+  val_at_start: false
+  overlong_filtering: false
+  val_batch_size: 256
+  seed: 42
+  # Mask sequences whose generation-vs-training logprob error exceeds this
+  # (same scale as the token_mult_prob_error metric). Matches the validated
+  # for-gen baseline; leaving it null also makes NeMo-RL skip the prev-logprob
+  # pass entirely when force_on_policy_ratio is set (opd.py:120).
+  seq_logprob_error_threshold: 2
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+  reward_shaping:
+    stop_properly_penalty_coef: null
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+policy:
+  # Site paths come from the environment (utility/config_data_lyris_ultra.sh).
+  model_name: ${oc.env:HF_CKPT_PATH}
+  tokenizer:
+    name: ${policy.model_name}
+    # Ultra ships its own chat_template.jinja in the checkpoint (byte-identical
+    # to nano3.5's); do NOT force qwen-style kwargs here (the base yaml sets
+    # enable_thinking for qwen).
+    chat_template_kwargs: null
+  train_global_batch_size: 16      # smoke default; baseline=512 via script
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 196608
+  precision: bfloat16
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: false
+  # Disabled: renamed to automodel_cfg upstream, and _v2 no longer gates checkpoint saving.
+  # dtensor_cfg:
+  #   # lm_policy.save_checkpoint keys the checkpointing_cfg pass-through off
+  #   # dtensor_cfg._v2 even on the Megatron path (swe1 does the same); without
+  #   # this, model_save_format=safetensors is rejected.
+  #   _v2: true
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    # LR-scheduler horizon = max_num_epochs * steps_per_epoch; the launch
+    # script recomputes it from the dataset size and PPS.
+    train_iters: 48
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8   # smoke; baseline=32 via script
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2        # smoke; baseline=16 via script
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    # for-gen's large-geometry flags (nano-era; unused on the gen-only
+    # rollout-benchmark path, which starts no training workers).
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: true
+    use_gloo_process_groups: false
+    use_fused_weighted_squared_relu: true
+    defer_fp32_logits: true
+    calculate_per_token_loss: true
+    moe_aux_loss_coeff: 0.0
+    apply_rope_fusion: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    mtp_loss_scaling_factor: 0.0
+    mtp_num_layers: 0    # RL@main pydantic requires int (MTP disabled anyway)
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      params_dtype: float32
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+    scheduler:
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+  sequence_packing:
+    enabled: true
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+    fuse_loss: true
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
+  max_grad_norm: 1.0
+
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: trtllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1     # one DEP32 prefill engine (32 GPUs, 8 nodes)
+      # Two DEP16 decode engines (32 GPUs): with one, decode was the bottleneck (job 533995: decode queue p50 42.9 s).
+      num_decode_engines: 2
+      num_frontend_workers: 8    # 2026-10-17: 4 -> 8
+      frontend_tokenize: true
+      # Default band [8300, 8556), below the 9000 ephemeral floor. The old 14900
+      # sat in this recipe's generation band (port_range 11001-15000).
+      # frontend_base_port: 14900
+    trtllm_cfg:
+      expose_http_server: true   # required for NeMo-Gym (agents hit the OpenAI server)
+      tensor_parallel_size: 16
+      # DEP16 (this variant): attention data parallel, moe_tp=1 x moe_ep=16 -- 32 full
+      # experts per rank (moe_tp*moe_ep must == tp). One ENGINE spans 4 GB200 nodes
+      # (4 GPUs/node); one replica (2 ctx + 2 gen) spans 16 nodes.
+      moe_tensor_parallel_size: 1
+      moe_expert_parallel_size: 16
+      max_model_len: ${policy.max_total_sequence_length}
+      precision: ${policy.precision}
+      async_engine: true
+      # Dedicated knob for KV free_gpu_memory_fraction (worker maps it via
+      # setdefault) — kv_cache_config below must NOT set
+      # free_gpu_memory_fraction or that explicit value would win.
+      gpu_memory_utilization: 0.8
+      max_batch_size: 64
+      max_num_tokens: 8192       # scheduler token budget (run spec)
+      # Track async-GRPO settings (single source of truth, cannot diverge)
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      # Ultra's chat_template.jinja is byte-identical to nano3.5's; the run
+      # spec pairs the qwen3_coder tool parser with the stock deepseek-r1
+      # reasoning parser (<think> split, reasoning_at_start).
+      tool_parser: qwen3_coder
+      reasoning_parser: deepseek-r1
+      default_chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
+        # The model sometimes omits the closing </think>; without this the
+        # parser files the whole generation under reasoning_content and the
+        # agent receives an empty message (LLMContextWindowExceedError,
+        # reward=0).
+        force_nonempty_content: true
+      # ---------------------------------------------------------------------
+      # PD DISAGGREGATION, current NeMo-RL schema (docs/design-docs/
+      # pd-disaggregation-rollout.md). Three blocks, each with one job:
+      #   policy.generation.disaggregation   the layout (engines per replica, frontends)
+      #   trtllm_cfg.{prefill,decode}_engine  per-role overrides of the knobs above;
+      #                                       a role's trtllm_kwargs are deep-merged over
+      #                                       generation.trtllm_kwargs
+      #   trtllm_cfg.disagg_server            forwarded to TRT-LLM's DisaggServerConfig
+      # The KV transceiver is generation.trtllm_kwargs.cache_transceiver_config.
+      # One replica = 1 prefill (DEP32) + 2 decode (DEP16) = 64 GPUs = 16 GB200 nodes.
+      # ---------------------------------------------------------------------
+      prefill_engine:
+        # DEP32: attention data parallel across 32 ranks (no TP on attention/Mamba), MoE experts split
+        # moe_ep 32 x moe_tp 1 (16 full experts per rank). One engine spans 8 nodes.
+        tensor_parallel_size: 32
+        moe_tensor_parallel_size: 1
+        moe_expert_parallel_size: 32
+        max_num_tokens: 1024           # the rate-matching ctx budget at C=1,024 (shared default: 8192)
+        gpu_memory_utilization: 0.70   # kv070 variant (was 0.80; rlrc ctx OOM, job 3332907)
+        # 2026-10-13: 16 -> 4. Each per-rank batch slot reserves an unsharded Mamba state (~0.8 GiB); with 16
+        # slots the startup profiling forward had 3.34 GiB free and the 9.64 GiB MoE workspace for cap 32768
+        # OOMed (job 3331161). 4 slots free ~9.7 GiB. Non-binding here: in E1/E1b the busiest ctx rank never
+        # scheduled more than 2 requests per step.
+        max_batch_size: 32   # 2026-10-16: 4 -> 32 for PPS=32. 64 left 2720 KV tokens per rank (job 3368309) and crashed on a long prefill
+        trtllm_kwargs:
+          enable_attention_dp: true                    # DEP: attention DP across the 16 ranks
+          # Pin each conversation (Gym session id, forwarded as conversation_params)
+          # to one attention-DP rank so its KV prefix stays on that rank. Without it
+          # TRT-LLM uses DefaultADPRouter (load-balanced) and turns of a trajectory
+          # scatter over the 16 ranks. conversation_affinity takes precedence over the
+          # KV-aware router when both are on. Same as the qwen35 disagg recipe.
+          attention_dp_config:
+            enable_kv_cache_aware_routing: true
+            kv_cache_routing_account_for_in_transfer: true
+            kv_cache_routing_conversation_affinity: true
+          # prefill_cuda_graph_backend: breakable       # BCG on prefill (aggregated best)
+          # Prefill MoE = MegaMoE (won the prefill phase in the single-backend arms: job 561318, exec p50 447 ms vs
+          # 497 CUTLASS / 566 TRTLLM).
+          moe_config:
+            backend: MEGAMOE_CUTEDSL
+            max_num_tokens: 1024     # MegaMoE reads it as the PER-RANK chunk cap; sizes its workspace (536065 OOM)
+          # Applied to os.environ before the Ray executor copies the environment into this engine's GPU workers only.
+          env_overrides:
+            TLLM_CUDA_OBJECT_COLLECTIVES: "1"   # NCCL attention-DP votes (gloo "0" was needed on rc28 for nccl#1906)
+            TRTLLM_CUTEDSL_SM_RESERVE: "8"      # MegaMoE + NCCL votes + overlap deadlock without it (560244-560247)
+          disable_overlap_scheduler: true              # overlap scheduler OFF on prefill (572703; default: on)
+          scheduler_config:
+            capacity_scheduler_policy: GUARANTEED_NO_EVICT
+            # Admit the pending context requests with the fewest prompt tokens not covered by reusable KV first
+            # (KV cache manager V2 scheduler only; default fcfs). context_starvation_iterations stays unset: no
+            # aging bound, so long prompts can wait behind shorter ones (step-1 wait p99 7.9 -> 15.6 s vs 573974).
+            context_scheduling_policy: shortest_uncached_first
+          stream_interval: 1                           # ctx leg is non-streaming
+          return_perf_metrics: true
+          perf_metrics_max_requests: 20000
+      decode_engine:
+        # DEP16 for the generation engine: attention data parallel across 16 ranks,
+        # moe_ep 16 x moe_tp 1.
+        tensor_parallel_size: 16
+        moe_tensor_parallel_size: 1
+        moe_expert_parallel_size: 16
+        gpu_memory_utilization: 0.85
+        # Per-rank batch under attention DP; each slot pins an unsharded Mamba state (829 MB),
+        # 64 slots = 53 GB fixed KV-pool cost (attempt 1). 16 x 16 ranks = 256 concurrent decodes.
+        max_batch_size: 32   # 2026-10-16: 16 -> 32 (512 concurrent decodes over 16 ranks). 64 left 2720 KV tokens per rank (job 3368309); mb64 also hit the KV v2 scheduler deadlock (543931)
+        max_num_tokens: 4096 # the rate-matching gen budget (shared default: 8192)
+        trtllm_kwargs:
+          # Decode MoE = TRTLLM (FlashInfer trtllm-gen BF16, NVLinkOneSided): best decode in the single-backend arms
+          # (job 562994: TPOT mean 28.4 ms vs 30.5 CUTLASS / 29.5 MegaMoE). Chunk cap = the shared 4096.
+          moe_config:
+            backend: TRTLLM
+          enable_attention_dp: true                    # DEP: attention DP across the 16 ranks
+          # Pin each conversation (Gym session id, forwarded as conversation_params)
+          # to one attention-DP rank so its KV prefix stays on that rank. Without it
+          # TRT-LLM uses DefaultADPRouter (load-balanced) and turns of a trajectory
+          # scatter over the 16 ranks. conversation_affinity takes precedence over the
+          # KV-aware router when both are on. Same as the qwen35 disagg recipe.
+          attention_dp_config:
+            enable_kv_cache_aware_routing: true
+            kv_cache_routing_account_for_in_transfer: true
+            kv_cache_routing_conversation_affinity: true
+          prefill_cuda_graph_backend: disabled         # gen runs no prefill
+          disable_overlap_scheduler: false             # overlap scheduler ON (default; decode win)
+          cuda_graph_config:
+            enable_padding: true
+          scheduler_config:
+            capacity_scheduler_policy: GUARANTEED_NO_EVICT
+          stream_interval: 10
+          return_perf_metrics: true
+          perf_metrics_max_requests: 20000
+      disagg_server:
+        # ctx must be stateful (conversation: sticky per trajectory) so later turns reach the
+        # prefill engine holding their prefix. gen_router conversation keeps each conversation on the decode engine
+        # that holds its KV (decode-routing A/B: load_balancing missed 50 % of turns in 514037, conversation <1 % in 529562).
+        ctx_router: conversation
+        gen_router: conversation
+        # false in smokes (plain relay); true in formals (base64 token-id relay,
+        # no message history on the gen leg -- text-only model, safe).
+        gen_tokids_ctxbytes: false
+        gen_strip_message_history: false
+    trtllm_kwargs:
+      # Without chunked prefill TRT-LLM rejects any prompt longer than
+      # max_num_tokens (8192) with RequestError -> HTTP 400 -> the agent dies
+      # the moment it reads a big file. vLLM enables this by default.
+      enable_chunked_prefill: true
+      # Explicit run-spec pins (plain LlmArgs fields; NeMo-RL's trtllm_cfg
+      # TypedDict doesn't declare pp, so it rides the kwargs escape hatch).
+      pipeline_parallel_size: 1
+      # MoE GEMM profile / chunking cap: at most this many tokens per
+      # fused-MoE call (inputs above it are split). Run spec: 32768, 4x the
+      # 8192 scheduler budget.
+      moe_config:
+        max_num_tokens: 4096     # DEP16: bounds the per-chunk MoE workspace (attempt 1 OOM at 32768)
+      # KV cache transceiver (an AsyncLLM argument, shared by both roles).
+      cache_transceiver_config:
+        # Hybrid Mamba disagg + reuse needs KV cache manager V2, which requires
+        # the Python transceiver with the NIXL backend (_util.py); NemotronH has
+        # no runtime preference so "auto" would pick C++ -- set PYTHON explicitly.
+        backend: NIXL
+        transceiver_runtime: PYTHON
+        max_tokens_in_buffer: 196608          # >= max_model_len (gen-side FCFS admission budget)
+        kv_transfer_timeout_ms: 600000        # 60 s default cancels in bulk under step-start bursts
+        kv_cache_bounce_size_mb: 0            # per-block path; 384 is the E9 arm
+      num_postprocess_workers: 0
+      stream_interval: 10
+      # Per-iteration observability (rc24 LlmArgs, all default false):
+      # print_iter_log emits one logger.info line per executor iteration —
+      # requires TLLM_LOG_LEVEL=INFO in the worker env (rc24 default is
+      # "error"; the launcher exports it). enable_iter_req_stats only takes
+      # effect together with enable_iter_perf_stats.
+      print_iter_log: true
+      enable_iter_perf_stats: true
+      enable_iter_req_stats: true
+      # MNNVL allreduce (this variant): ACTIVE only on the custom nano-bcg
+      # wheel — it bootstraps the MNNVL workspace via the TP ProcessGroup
+      # under Ray (stock rc24 silently falls back to NCCL).
+      allreduce_strategy: MNNVL
+      # BCG (this variant): breakable prefill CUDA graphs (PR #16609 lineage,
+      # nano-validated incl. the mamba2 boundary op). Field exists ONLY on the
+      # custom wheel. fp32 SSM below is the standing BCG+MNNVL mitigation;
+      # never profile this config with nsys.
+      # prefill_cuda_graph_backend: breakable
+      kv_cache_config:
+        # Block reuse validated stable + score-neutral on the rc24 wheel in
+        # the nano campaign; adopted as the default upstream (1110ce14).
+        enable_block_reuse: true
+        # explicit (auto resolves to V2 for hybrid Mamba anyway); V2 is what makes
+        # hybrid-Mamba disaggregation with block reuse work on public main.
+        use_kv_cache_manager_v2: true
+        # free_gpu_memory_fraction intentionally NOT set here — it would
+        # override trtllm_cfg.gpu_memory_utilization (0.8) above.
+        dtype: auto
+        # PER-CONVERSATION REUSE, ATTEMPT 2 (2026-09-06). Attempt 1
+        # (2882136/2882137/2883065/2883066) set only the policy: on this hybrid
+        # Mamba model the policy validator zeroes the periodic snapshot interval
+        # and, with no explicit boundary configured, model_loader.py then turned
+        # block reuse OFF entirely (driver log: "Disabling KV cache block reuse
+        # for the hybrid Mamba model"; effective enable_block_reuse=False).
+        # This attempt adds the explicit stable boundary the docs require.
+        # Requests still carry no conversation id, so per-conversation
+        # retention (max_num_turns) is inert; effective behaviour = per_request
+        # commits + a Mamba snapshot at each prompt end.
+        block_reuse_config:
+          policy: per_conversation
+          max_num_turns: 3
+        # rc24 renamed mamba_state_cache_interval to this nested field; setting
+        # the legacy name trips a non-idempotent migration validator on
+        # re-validation ("Cannot set both ...").
+        mamba_state_config:
+          # Kept at the baseline value on purpose (user decision 2026-09-06).
+          # With policy=per_conversation the KvCacheConfig validator
+          # (llm_args.py disable_periodic_mamba_snapshots_for_conversations)
+          # forces it to 0 and logs "...is ignored because ...policy=
+          # per_conversation...; setting it to 0" -- expected and harmless.
+          periodic_snapshot_interval: 8192
+          # REQUIRED with per_conversation on a hybrid Mamba model. End offset 0
+          # = a Mamba state snapshot at the prompt end (= where the next turn
+          # resumes). Without any explicit offset, model_loader.py disables
+          # block reuse entirely.
+          additional_snapshot_offsets_from_end: [0]
+        # float32 per run spec — matches the dtype ultra's config.json
+        # declares (the stochastic-rounding knobs only apply to
+        # half-precision caches, so they are dropped).
+        mamba_ssm_cache_dtype: float32
+        # KV/SSM pool split for KV cache manager V2 on hybrid Mamba. Unset, it
+        # falls back to max_seq_len / 2 (98304), about 2x the measured
+        # per-call total (~47.5k, job 3369688), over-sizing the attention pool
+        # at the SSM snapshot pool's expense.
+        avg_seq_len: 49152
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1     # overridden by launch script
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
+  validation:
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+  _override_: true
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: true
+    # Gym run artifacts (per-rollout timeline.jsonl, OpenHands trajectories, the
+    # apptainer persistent_dir) on a mounted path; Gym's default is inside the
+    # container. launch_gen_only.sh mounts <LOGDIR>/nemo_logs at /logs.
+    results_dir: /logs/nemo_gym
+    port_range_low: 15001
+    port_range_high: 20000
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    # Gym shards: one SWE shard, replicated once per node (default STRICT_SPREAD),
+    # so the OpenHands sandboxes of 32 x 16 trajectories (x2 in flight under
+    # async) spread over all 16 nodes instead of one Gym actor on the head node.
+    # Prompt groups go to the replicas round-robin. The single shard owns every
+    # inherited overlay below (policy_model, swe_agents_train/val).
+    config_paths: null
+    shards:
+      - name: swe
+        replicas: 16   # one per node of the 16-node layout (STRICT_SPREAD needs a node per replica)
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    # Match the validated vllm baseline: keep prior-turn <think> in re-rendered
+    # history (truncate_history_thinking=false) to preserve token monotonicity.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+          # Send each rollout's Gym session id as conversation_params.conversation_id
+          # (NVIDIA-NeMo/Gym#3582), so ctx_router: conversation keeps every turn of a
+          # trajectory on the ADP rank holding its KV prefix.
+          forward_session_id_as_conversation_id: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
+          swebench_agent_timeout: 1800   # 2026-11-09 user request (kv070 base: 3600)
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          apptainer_memory_limit_mb: 65536
+          # Disabled for the SWE image (nemo-rl-trtllm-disagg-trt95ea967-...-swe.sqsh): it bakes
+          # sdevare-nv/nv-OpenHands @ 5f018005 (Gym's default) + the Lyris arm64 SIF fix +
+          # the Gym strict-schema fixes. Pinning shikiw's local 7644d678 here would make Gym
+          # fetch and `reset --hard` the baked tree at startup.
+          # Lyris-local OpenHands fork with RC6/7/8 arm64-SIF fixes
+          # agent_framework_repo: /lustre/fsw/coreai_comparch_trtllm/shikiw/nv-OpenHands
+          # agent_framework_commit: 7644d6785f94f01a5ef4806d9584f07830d4ca53
+          container_formatter:
+            # All 403 dataset instances (dominicw's swe_sif holds only 17 of them).
+            - "${oc.env:NEMO_GYM_SWE_SIF_DIR}/swe-bench.eval.arm64.{instance_id}.sif"
+            # - "/lustre/fsw/coreai_comparch_trtllm/dominicw/ultra_rollout_bench/swe_sif/swe-bench.eval.arm64.{instance_id}.sif"   # rebuilt/pulled 2026-10-11 (joyang/hsg_s3_data vanished 2026-10-07)
+            # - "/lustre/fsw/coreai_comparch_trtllm/joyang/hsg_s3_data/swe-bench.eval.arm64.{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
+          swebench_agent_timeout: 1800   # 2026-11-09 user request (kv070 base: 3600)
+          dataset_path: ${data.validation.data_path}
+          apptainer_memory_limit_mb: 65536
+          # agent_framework_repo: /lustre/fsw/coreai_comparch_trtllm/shikiw/nv-OpenHands  (see swe_agents_train)
+          # agent_framework_commit: 7644d6785f94f01a5ef4806d9584f07830d4ca53
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+    use_absolute_ip: true
+  _override_: true
+
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: nemorl-nemotron
+    name: ultra-swe-trtllm
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
