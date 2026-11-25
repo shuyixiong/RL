@@ -46,6 +46,13 @@ class TrtllmDisaggServerConfig(BaseModel, extra="forbid"):
     # carry the full prefix, so the decode adapter never needs the messages
     # (DisaggServerConfig.gen_strip_message_history).
     gen_strip_message_history: bool = False
+    # Strip the conversation history from the prefill leg once it is routed, when
+    # the request carries prompt token ids (frontend_tokenize). The prefill
+    # adapter renders nothing then, so the history only costs its single HTTP
+    # process a JSON parse and validation of the whole conversation
+    # (DisaggServerConfig.ctx_strip_message_history). Leave off while
+    # NRL_TRTLLM_TOKENIZE_SHADOW_RATE > 0: shadow validation re-renders the messages.
+    ctx_strip_message_history: bool = False
 
 
 class TrtllmEngineKnobs(TypedDict, total=False):

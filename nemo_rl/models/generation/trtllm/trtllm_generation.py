@@ -706,6 +706,7 @@ class TrtllmGeneration(GenerationInterface):
                 "gen_router": server.gen_router,
                 "gen_tokids_ctxbytes": server.gen_tokids_ctxbytes,
                 "gen_strip_message_history": server.gen_strip_message_history,
+                "ctx_strip_message_history": server.ctx_strip_message_history,
                 "frontend_tokenize": disagg.frontend_tokenize,
                 "model_name": self.cfg["model_name"],
                 "default_chat_template_kwargs": self.cfg["trtllm_cfg"].get(

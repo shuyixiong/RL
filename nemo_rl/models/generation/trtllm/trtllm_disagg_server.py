@@ -54,6 +54,7 @@ def build_config(
     gen_router: str,
     gen_tokids_ctxbytes: bool = False,
     gen_strip_message_history: bool = False,
+    ctx_strip_message_history: bool = False,
 ) -> Any:
     """Assemble the ``DisaggServerConfig`` for one replica.
 
@@ -94,6 +95,7 @@ def build_config(
     # relay stops re-serializing a 30k-int id array and the full history.
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.gen_strip_message_history = gen_strip_message_history
+    config.ctx_strip_message_history = ctx_strip_message_history
     return config
 
 
@@ -600,6 +602,7 @@ class DisaggServerActorImpl:
         gen_router: str,
         gen_tokids_ctxbytes: bool = False,
         gen_strip_message_history: bool = False,
+        ctx_strip_message_history: bool = False,
         frontend_tokenize: bool = False,
         model_name: Optional[str] = None,
         default_chat_template_kwargs: Optional[dict[str, Any]] = None,
@@ -618,6 +621,7 @@ class DisaggServerActorImpl:
             gen_router=gen_router,
             gen_tokids_ctxbytes=gen_tokids_ctxbytes,
             gen_strip_message_history=gen_strip_message_history,
+            ctx_strip_message_history=ctx_strip_message_history,
         )
         tokenize_fn = None
         if frontend_tokenize:

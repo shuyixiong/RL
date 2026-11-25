@@ -17,6 +17,10 @@
 #                                                                            19.7 % -> 6.9 %, mean 30.2 -> 28.2 ms)
 #   disagg_server gen_tokids_ctxbytes / gen_strip_message_history true       the decode worker's HTTP process no longer
 #                                                                            parses the full conversation each turn
+#   disagg_server ctx_strip_message_history true                            the prefill worker's single HTTP process gets
+#                                                                            the frontend's prompt ids and the last message
+#                                                                            only; with the full history its parse queue
+#                                                                            reached 8-13 s (intake p90) in the step-1 burst
 #   cache_transceiver_config.max_tokens_in_buffer unset                      the explicit 196608 turned on a gen-side
 #                                                                            FCFS transfer window charged by full prompt
 #                                                                            length (the Python transceiver ignores the
@@ -386,6 +390,7 @@ policy:
         # Base64 token-id relay and no message history on the gen leg (text-only model, safe).
         gen_tokids_ctxbytes: true
         gen_strip_message_history: true
+        ctx_strip_message_history: true
     trtllm_kwargs:
       # Without chunked prefill TRT-LLM rejects any prompt longer than
       # max_num_tokens (8192) with RequestError -> HTTP 400 -> the agent dies
